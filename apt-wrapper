@@ -1,0 +1,314 @@
+#!/bin/bash
+# =============================================================================
+# APT Tracker Wrapper
+# Installed : /usr/local/bin/apt
+# Real apt  : /usr/bin/apt  (never touched)
+# Records   : /var/lib/apt-tracker/records.csv
+# =============================================================================
+
+APT_REAL="/usr/bin/apt"
+TRACKER_DIR="/var/lib/apt-tracker"
+RECORDS_FILE="$TRACKER_DIR/records.csv"
+LOCK_FILE="$TRACKER_DIR/lock"
+CSV_HEADER="action,package,version,timestamp,user,status"
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+sanitize() { echo "$1" | tr -d '",\n\r'; }
+get_user()  { [ -n "$SUDO_USER" ] && echo "$SUDO_USER" || whoami; }
+
+ensure_records_file() {
+    mkdir -p "$TRACKER_DIR"
+    [ -f "$RECORDS_FILE" ] || echo "$CSV_HEADER" > "$RECORDS_FILE"
+}
+
+write_record() {
+    local action="$1" pkg="$2" ver="$3" user="$4" status="$5"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    pkg=$(sanitize "$pkg")
+    ver=$(sanitize "$ver")
+    user=$(sanitize "$user")
+    ensure_records_file
+    (
+        flock -x 200
+        echo "\"$action\",\"$pkg\",\"$ver\",\"$ts\",\"$user\",\"$status\"" >> "$RECORDS_FILE"
+    ) 200>"$LOCK_FILE"
+}
+
+# ─────────────────────────────────────────────
+# Parse packages actually acted on from apt output.
+# apt prints section headers before the package list.
+# We capture stdout via tee so the user still sees
+# everything in real time.
+# ─────────────────────────────────────────────
+get_version() {
+    dpkg-query -W -f='${Version}' "$1" 2>/dev/null || echo "n/a"
+}
+
+# ─────────────────────────────────────────────
+# Time filter helper
+# ─────────────────────────────────────────────
+get_cutoff() {
+    case "$1" in
+        week)  date -d "7 days ago"   '+%Y-%m-%d' ;;
+        month) date -d "30 days ago"  '+%Y-%m-%d' ;;
+        year)  date -d "365 days ago" '+%Y-%m-%d' ;;
+        *) echo "" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────
+# HISTORY HELP
+# ─────────────────────────────────────────────
+history_help() {
+    echo ""
+    echo "APT Tracker — history command"
+    echo ""
+    echo "Usage:"
+    echo "  apt history [action] [--last week|month|year]"
+    echo ""
+    echo "Examples:"
+    echo "  apt history"
+    echo "  apt history install"
+    echo "  apt history remove --last week"
+    echo "  apt history upgrade --last month"
+    echo "  apt history stats"
+    echo "  apt history search <pkg>"
+    echo "  apt history export [file]"
+    echo "  apt history clear"
+    echo ""
+}
+
+# ─────────────────────────────────────────────
+# HISTORY VIEW
+# ─────────────────────────────────────────────
+show_history() {
+    local filter="$1" period="$2" cutoff=""
+    ensure_records_file
+    [ -n "$period" ] && cutoff=$(get_cutoff "$period")
+
+    printf "\n%-12s %-25s %-20s %-20s %-10s %-8s\n" \
+        "ACTION" "PACKAGE" "VERSION" "TIMESTAMP" "USER" "STATUS"
+    printf "%s\n" "$(printf '─%.0s' {1..98})"
+
+    local count=0
+    while IFS=',' read -r a p v ts u s; do
+        a="${a//\"/}"; p="${p//\"/}"; v="${v//\"/}"
+        ts="${ts//\"/}"; u="${u//\"/}"; s="${s//\"/}"
+        [ -z "$a" ] && continue
+
+        # action filter
+        if [ -n "$filter" ]; then
+            case "$filter" in
+                upgrade) [[ "$a" != "upgrade" && "$a" != "dist-upgrade" && "$a" != "full-upgrade" ]] && continue ;;
+                remove)  [[ "$a" != "remove"  && "$a" != "purge" ]] && continue ;;
+                *)       [ "$a" != "$filter" ] && continue ;;
+            esac
+        fi
+
+        # time filter
+        if [ -n "$cutoff" ]; then
+            d="${ts%% *}"
+            [[ "$d" < "$cutoff" ]] && continue
+        fi
+
+        printf "%-12s %-25s %-20s %-20s %-10s %-8s\n" \
+            "$a" "$p" "$v" "$ts" "$u" "$s"
+        count=$((count + 1))
+    done < <(tail -n +2 "$RECORDS_FILE")
+
+    printf "%s\n" "$(printf '─%.0s' {1..98})"
+    echo "  Total: $count record(s)"
+    echo ""
+}
+
+show_stats() {
+    ensure_records_file
+    local total=0 installs=0 removes=0 upgrades=0 updates=0 autorems=0 failed=0
+    while IFS=',' read -r a _p _v _ts _u s; do
+        a="${a//\"/}"; s="${s//\"/}"
+        [ -z "$a" ] && continue
+        total=$((total + 1))
+        [ "$s" = "failed" ] && { failed=$((failed + 1)); continue; }
+        case "$a" in
+            install)                                  installs=$((installs + 1)) ;;
+            remove|purge)                             removes=$((removes   + 1)) ;;
+            upgrade|full-upgrade|dist-upgrade)        upgrades=$((upgrades + 1)) ;;
+            update)                                   updates=$((updates   + 1)) ;;
+            autoremove)                               autorems=$((autorems + 1)) ;;
+        esac
+    done < <(tail -n +2 "$RECORDS_FILE")
+    echo ""
+    echo "  Installs    : $installs"
+    echo "  Removes     : $removes"
+    echo "  Upgrades    : $upgrades"
+    echo "  Updates     : $updates"
+    echo "  Autoremoves : $autorems"
+    echo "  Failed      : $failed"
+    echo "  ──────────────"
+    echo "  Total       : $total"
+    echo "  File        : $RECORDS_FILE"
+    echo ""
+}
+
+search_history() {
+    local term="$1"
+    [ -z "$term" ] && { echo "Usage: apt history search <package>"; return 1; }
+    ensure_records_file
+    printf "\n%-12s %-25s %-20s %-20s %-10s %-8s\n" \
+        "ACTION" "PACKAGE" "VERSION" "TIMESTAMP" "USER" "STATUS"
+    printf "%s\n" "$(printf '─%.0s' {1..98})"
+    local count=0
+    while IFS=',' read -r a p v ts u s; do
+        a="${a//\"/}"; p="${p//\"/}"; v="${v//\"/}"
+        ts="${ts//\"/}"; u="${u//\"/}"; s="${s//\"/}"
+        [ -z "$a" ] && continue
+        echo "$p" | grep -qi "$term" || continue
+        printf "%-12s %-25s %-20s %-20s %-10s %-8s\n" "$a" "$p" "$v" "$ts" "$u" "$s"
+        count=$((count + 1))
+    done < <(tail -n +2 "$RECORDS_FILE")
+    printf "%s\n" "$(printf '─%.0s' {1..98})"
+    echo "  Found: $count record(s)"
+    echo ""
+}
+
+export_history() {
+    local dest="${1:-$HOME/apt-history-$(date +%Y%m%d_%H%M%S).csv}"
+    ensure_records_file
+    cp "$RECORDS_FILE" "$dest" && echo "  Exported to: $dest" || echo "  Export failed."
+}
+
+clear_history() {
+    ensure_records_file
+    echo -n "  Clear ALL history? [y/N]: "
+    read -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "$CSV_HEADER" > "$RECORDS_FILE"
+        echo "  History cleared."
+    else
+        echo "  Cancelled."
+    fi
+}
+
+# ─────────────────────────────────────────────
+# HISTORY ROUTER
+# ─────────────────────────────────────────────
+handle_history() {
+    local filter="" period=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            install|remove|purge|update|upgrade|full-upgrade|dist-upgrade|autoremove)
+                filter="$1" ;;
+            --last)
+                shift; period="$1" ;;
+            week|month|year)
+                period="$1" ;;
+            stats)   show_stats;             return ;;
+            search)  shift; search_history "$1"; return ;;
+            export)  shift; export_history "$1"; return ;;
+            clear)   clear_history;          return ;;
+            help|--help) history_help;       return ;;
+            *) echo "Unknown: $1"; history_help; return ;;
+        esac
+        shift
+    done
+
+    show_history "$filter" "$period"
+}
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+main() {
+    local action="${1:-}"
+    local user; user=$(get_user)
+
+    # ── history command — never calls real apt ──
+    if [ "$action" = "history" ]; then
+        shift
+        handle_history "$@"
+        exit 0
+    fi
+
+    # ── real apt must exist ──
+    [ -x "$APT_REAL" ] || { echo "apt not found at $APT_REAL"; exit 1; }
+
+    # ── non-tracked commands pass straight through ──
+    case "$action" in
+        install|remove|purge|autoremove|upgrade|full-upgrade|dist-upgrade|update)
+            : ;;   # fall through to tracking
+        *)
+            exec "$APT_REAL" "$@"
+            ;;
+    esac
+
+    # ── update: no package list, record one event ──
+    if [ "$action" = "update" ]; then
+        "$APT_REAL" "$@"
+        local exit_code=$?
+        [ "$exit_code" -eq 0 ] \
+            && write_record "update" "(cache)" "n/a" "$user" "success" \
+            || write_record "update" "(cache)" "n/a" "$user" "failed"
+        exit "$exit_code"
+    fi
+
+    # ── tracked commands ──
+    # Simulate first to get the package list, then run for real.
+    # apt-get -s (simulate) shows what will change without doing it.
+    # "Inst pkg" = will be installed or upgraded
+    # "Remv pkg" = will be removed
+    local inst_pkgs=()   # packages being installed or upgraded
+    local remv_pkgs=()   # packages being removed
+
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        if echo "$line" | grep -q "^Inst "; then
+            pkg=$(echo "$line" | awk '{print $2}')
+            inst_pkgs+=("$pkg")
+        elif echo "$line" | grep -q "^Remv "; then
+            pkg=$(echo "$line" | awk '{print $2}')
+            remv_pkgs+=("$pkg")
+        fi
+    done < <(/usr/bin/apt-get -s "$@" 2>/dev/null)
+
+    # Run real apt — fully interactive, no pipes, user sees everything
+    "$APT_REAL" "$@"
+    local exit_code=$?
+
+    # Write records only if apt succeeded
+    if [ "$exit_code" -eq 0 ]; then
+        case "$action" in
+            install)
+                for pkg in "${inst_pkgs[@]}"; do
+                    ver=$(get_version "$pkg")
+                    write_record "install" "$pkg" "$ver" "$user" "success"
+                done
+                ;;
+            upgrade|full-upgrade|dist-upgrade)
+                for pkg in "${inst_pkgs[@]}"; do
+                    ver=$(get_version "$pkg")
+                    write_record "$action" "$pkg" "$ver" "$user" "success"
+                done
+                for pkg in "${remv_pkgs[@]}"; do
+                    write_record "$action" "$pkg" "n/a" "$user" "success"
+                done
+                ;;
+            remove|purge)
+                for pkg in "${remv_pkgs[@]}"; do
+                    write_record "$action" "$pkg" "n/a" "$user" "success"
+                done
+                ;;
+            autoremove)
+                for pkg in "${remv_pkgs[@]}"; do
+                    write_record "autoremove" "$pkg" "n/a" "$user" "success"
+                done
+                ;;
+        esac
+    fi
+
+    exit "$exit_code"
+}
+
+main "$@"
