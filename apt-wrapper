@@ -1,27 +1,22 @@
 #!/bin/bash
 # =============================================================================
-# APT Tracker Wrapper (STATE MODE)
-# Installed : /usr/local/bin/apt
-# Real apt  : /usr/bin/apt
-# Records   : /var/lib/apt-tracker/records.csv
-# Purpose   : Track ONLY currently installed packages (no history)
+# APT Tracker Wrapper (App-only mode, keeps same commands)
 # =============================================================================
 
 APT_REAL="/usr/bin/apt"
-TRACKER_DIR="/var/lib/apt-tracker"
-RECORDS_FILE="$TRACKER_DIR/records.csv"
-LOCK_FILE="$TRACKER_DIR/lock"
-CSV_HEADER="action,package,version,timestamp,user,status"
+TRACKER_FILE="/var/lib/apt-tracker/apps.csv"
+LOCK_FILE="/var/lib/apt-tracker/lock"
+CSV_HEADER="package,version,timestamp,user"
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 sanitize() { echo "$1" | tr -d '",\n\r'; }
-get_user()  { [ -n "$SUDO_USER" ] && echo "$SUDO_USER" || whoami; }
+get_user() { [ -n "$SUDO_USER" ] && echo "$SUDO_USER" || whoami; }
 
-ensure_records_file() {
-    mkdir -p "$TRACKER_DIR"
-    [ -f "$RECORDS_FILE" ] || echo "$CSV_HEADER" > "$RECORDS_FILE"
+ensure_file() {
+    mkdir -p "$(dirname "$TRACKER_FILE")"
+    [ -f "$TRACKER_FILE" ] || echo "$CSV_HEADER" > "$TRACKER_FILE"
 }
 
 get_version() {
@@ -29,68 +24,85 @@ get_version() {
 }
 
 # ─────────────────────────────────────────────
-# STATE MANAGEMENT (NEW LOGIC)
+# STATE MANAGEMENT
 # ─────────────────────────────────────────────
-add_or_update_record() {
-    local action="$1" pkg="$2" ver="$3" user="$4"
-    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+add_app() {
+    local pkg="$1" user="$2"
+    local ver ts
+
+    ver=$(get_version "$pkg")
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
 
     pkg=$(sanitize "$pkg")
     ver=$(sanitize "$ver")
     user=$(sanitize "$user")
 
-    ensure_records_file
+    ensure_file
 
     (
         flock -x 200
-
-        # Remove old entry if exists
-        grep -v "\"$pkg\"" "$RECORDS_FILE" > "$RECORDS_FILE.tmp"
-
-        # Add updated entry
-        echo "\"$action\",\"$pkg\",\"$ver\",\"$ts\",\"$user\",\"installed\"" >> "$RECORDS_FILE.tmp"
-
-        mv "$RECORDS_FILE.tmp" "$RECORDS_FILE"
+        grep -v "^\"$pkg\"," "$TRACKER_FILE" > "$TRACKER_FILE.tmp"
+        echo "\"$pkg\",\"$ver\",\"$ts\",\"$user\"" >> "$TRACKER_FILE.tmp"
+        mv "$TRACKER_FILE.tmp" "$TRACKER_FILE"
     ) 200>"$LOCK_FILE"
 }
 
-remove_record() {
+remove_app() {
     local pkg="$1"
     pkg=$(sanitize "$pkg")
 
-    ensure_records_file
+    ensure_file
 
     (
         flock -x 200
-        grep -v "\"$pkg\"" "$RECORDS_FILE" > "$RECORDS_FILE.tmp"
-        mv "$RECORDS_FILE.tmp" "$RECORDS_FILE"
+        grep -v "^\"$pkg\"," "$TRACKER_FILE" > "$TRACKER_FILE.tmp"
+        mv "$TRACKER_FILE.tmp" "$TRACKER_FILE"
     ) 200>"$LOCK_FILE"
 }
 
 # ─────────────────────────────────────────────
-# HISTORY (NOW SHOWS CURRENT STATE)
+# HISTORY (same command, new meaning)
 # ─────────────────────────────────────────────
-show_history() {
-    ensure_records_file
+history_help() {
+    echo ""
+    echo "APT Tracker — history command"
+    echo ""
+    echo "Usage:"
+    echo "  apt history"
+    echo ""
+    echo "Shows currently installed user applications"
+    echo ""
+}
 
-    printf "\n%-12s %-25s %-20s %-20s %-10s %-10s\n" \
-        "ACTION" "PACKAGE" "VERSION" "TIMESTAMP" "USER" "STATUS"
-    printf "%s\n" "$(printf '─%.0s' {1..105})"
+show_history() {
+    ensure_file
+
+    printf "\n%-25s %-20s %-20s %-10s\n" \
+        "PACKAGE" "VERSION" "INSTALLED ON" "USER"
+    printf "%s\n" "$(printf '─%.0s' {1..80})"
 
     local count=0
-    while IFS=',' read -r a p v ts u s; do
-        a="${a//\"/}"; p="${p//\"/}"; v="${v//\"/}"
-        ts="${ts//\"/}"; u="${u//\"/}"; s="${s//\"/}"
-        [ -z "$a" ] && continue
+    while IFS=',' read -r p v ts u; do
+        p="${p//\"/}"; v="${v//\"/}"
+        ts="${ts//\"/}"; u="${u//\"/}"
+        [ -z "$p" ] && continue
 
-        printf "%-12s %-25s %-20s %-20s %-10s %-10s\n" \
-            "$a" "$p" "$v" "$ts" "$u" "$s"
+        printf "%-25s %-20s %-20s %-10s\n" \
+            "$p" "$v" "$ts" "$u"
+
         count=$((count + 1))
-    done < <(tail -n +2 "$RECORDS_FILE")
+    done < <(tail -n +2 "$TRACKER_FILE")
 
-    printf "%s\n" "$(printf '─%.0s' {1..105})"
-    echo "  Total installed tracked packages: $count"
+    printf "%s\n" "$(printf '─%.0s' {1..80})"
+    echo "Total apps: $count"
     echo ""
+}
+
+handle_history() {
+    case "$1" in
+        help|--help) history_help ;;
+        *) show_history ;;
+    esac
 }
 
 # ─────────────────────────────────────────────
@@ -98,56 +110,45 @@ show_history() {
 # ─────────────────────────────────────────────
 main() {
     local action="${1:-}"
+    shift
     local user; user=$(get_user)
 
-    # Show current tracked state
+    # KEEP SAME COMMAND: apt history
     if [ "$action" = "history" ]; then
-        show_history
+        handle_history "$@"
         exit 0
     fi
 
-    [ -x "$APT_REAL" ] || { echo "apt not found at $APT_REAL"; exit 1; }
+    [ -x "$APT_REAL" ] || { echo "apt not found"; exit 1; }
 
-    # Only track specific commands
     case "$action" in
-        install|remove|purge|autoremove|upgrade|full-upgrade|dist-upgrade)
+        install|remove|purge)
             : ;;
         *)
-            exec "$APT_REAL" "$@"
+            exec "$APT_REAL" "$action" "$@"
             ;;
     esac
 
-    # Simulate to get affected packages
-    local inst_pkgs=()
-    local remv_pkgs=()
+    # Only user-entered packages
+    user_pkgs=()
+    for arg in "$@"; do
+        [[ "$arg" =~ ^- ]] && continue
+        user_pkgs+=("$arg")
+    done
 
-    while IFS= read -r line; do
-        line="${line//$'\r'/}"
-        if echo "$line" | grep -q "^Inst "; then
-            pkg=$(echo "$line" | awk '{print $2}')
-            inst_pkgs+=("$pkg")
-        elif echo "$line" | grep -q "^Remv "; then
-            pkg=$(echo "$line" | awk '{print $2}')
-            remv_pkgs+=("$pkg")
-        fi
-    done < <(/usr/bin/apt-get -s "$@" 2>/dev/null)
-
-    # Run actual apt
-    "$APT_REAL" "$@"
+    "$APT_REAL" "$action" "${user_pkgs[@]}"
     local exit_code=$?
 
-    # Update state only on success
     if [ "$exit_code" -eq 0 ]; then
         case "$action" in
-            install|upgrade|full-upgrade|dist-upgrade)
-                for pkg in "${inst_pkgs[@]}"; do
-                    ver=$(get_version "$pkg")
-                    add_or_update_record "install" "$pkg" "$ver" "$user"
+            install)
+                for pkg in "${user_pkgs[@]}"; do
+                    add_app "$pkg" "$user"
                 done
                 ;;
-            remove|purge|autoremove)
-                for pkg in "${remv_pkgs[@]}"; do
-                    remove_record "$pkg"
+            remove|purge)
+                for pkg in "${user_pkgs[@]}"; do
+                    remove_app "$pkg"
                 done
                 ;;
         esac
